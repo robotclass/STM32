@@ -61,6 +61,15 @@ void Error_Handler(void);
 #define CI_GPIO_Port GPIOA
 #define DI_Pin GPIO_PIN_1
 #define DI_GPIO_Port GPIOA
+#define SW2_Pin GPIO_PIN_2
+#define SW2_GPIO_Port GPIOA
+#define SW1_Pin GPIO_PIN_4
+#define SW1_GPIO_Port GPIOA
+#define BTN_Pin GPIO_PIN_5
+#define BTN_GPIO_Port GPIOA
+#define BTN_EXTI_IRQn EXTI4_15_IRQn
+#define SW3_Pin GPIO_PIN_1
+#define SW3_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 #define TRANSFER_DIR_WRITE      0x1

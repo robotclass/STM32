@@ -31,24 +31,41 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define VERSION 2
+
 #define LED_Q 16
+#define LED_MAX LED_Q-1
 #define LED_SHIFT 4
 
+#define DEF_BRIGHTNESS 5
+#define DEF_COLOR_R 255
+#define DEF_COLOR_G 0
+#define DEF_COLOR_B 0
+
 #define SRC_ENC 0
-#define SRC_POT 0
+#define SRC_POT 1
+
+#define ENC_STOP_MAX 1
+#define ENC_STOP_MIN 2
+#define ENC_BTN_TO 200
 
 #define MODE_FLOOD 0
 #define MODE_LEVEL 1
 #define MODE_POINT 2
+#define MODE_TRAIL 3
 
-#define CMD_GET_EPOS		0xBA // получение позиции энкодера 0..15
-#define CMD_GET_PPOS		0xBB // получение позиции потенциометра 0..4095
-#define CMD_SET_MODE		0xCA // установка режима
-#define CMD_SET_COLOR		0xCB // установка цвета
-#define CMD_SET_BRIGHTNESS	0xCC // установка яркости
-#define CMD_SET_SRC			0xCD // выбор источника сигнала
-#define CMD_RESET			0xCE // сброс счётчика
-#define CMD_RUN_TEST		0xCF // запуск RGB теста
+#define CMD_GET_VERSION		0xB0 // версия прошивки
+#define CMD_GET_SRC			0xB1 // получение источника сигнала 0 - энкодер, 1 - потенциометр
+#define CMD_GET_STATE		0xB2 // получение состояния: байты 1 и 2 - позиция, байт 3 - состояние кнопки
+#define CMD_SET_MODE		0xC0 // установка режима
+#define CMD_SET_COLOR		0xC1 // установка цвета
+#define CMD_SET_BRIGHTNESS	0xC2 // установка яркости
+#define CMD_SET_POT_LPF		0xC3 // установка коэффициента ФНЧ для потенциометра 1..15
+#define CMD_SET_ENC_LIMIT	0xC4 // установка предела энкодера
+#define CMD_SET_ENC_MAX		0xC5 // установка диапазона энкодера
+#define CMD_INIT			0xE0 // инициализация счётчика
+#define CMD_RESET			0xE1 // сброс счётчика
+#define CMD_TEST			0xE2 // запуск RGB теста
 
 /* USER CODE END PD */
 
@@ -59,9 +76,11 @@
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc;
+DMA_HandleTypeDef hdma_adc;
 
 I2C_HandleTypeDef hi2c1;
 
+TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim3;
 
 /* USER CODE BEGIN PV */
@@ -70,33 +89,53 @@ struct pixel_color{
 };
 
 struct pixel_color pixels[LED_Q];
+struct pixel_color trail_pixels[3];
 
-uint8_t current_brightness = 5;
-struct pixel_color current_color = {255,0,0};
+uint8_t current_brightness = DEF_BRIGHTNESS;
+struct pixel_color current_color = {DEF_COLOR_R, DEF_COLOR_G, DEF_COLOR_B};
 uint8_t current_mode = MODE_LEVEL;
 uint8_t current_src = SRC_ENC;
 
+// i2c
 uint8_t i2c_recv_buf[8];
 uint8_t i2c_send_buf[8];
-uint8_t packet_size = 0;
 
-volatile uint8_t flag = 0;
+// enc
+uint16_t enc_pos = 0;
+uint8_t enc_limit = 0;
+uint8_t enc_max = 0;
+uint8_t enc_stop = 0;
+volatile uint32_t enc_btn_next = 0;
+
+// pot
+uint16_t pot_adc;
+uint32_t pot_lpf = 0;
+uint16_t pot_lpf_k = 1024;
+volatile uint8_t flag_adc = 0;
+
+//volatile uint8_t flag = 0;
 volatile uint8_t transferDirection, transferRequested, i2c_data_ready;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_ADC_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
 uint8_t getHWIdx(uint8_t i);
 void updateLeds();
 void setPixelColor(uint8_t led, struct pixel_color color);
 void setPixelColorRGB(uint8_t led, uint8_t r, uint8_t g, uint8_t b);
 void testRGB();
-void handleEncoder();
+void initPot( uint8_t init );
+void handlePot();
+void initEnc( uint8_t init );
+void handleEnc();
+void draw( uint8_t pos );
 void packInt(uint8_t target[], volatile uint16_t source[], uint8_t ssize, uint8_t tstart);
 void handleI2C();
 /* USER CODE END PFP */
@@ -134,12 +173,13 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_ADC_Init();
   MX_TIM3_Init();
   MX_I2C1_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
 
-  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL); // запуск энкодера
   HAL_I2C_EnableListen_IT(&hi2c1); // запуск прерываний I2C
 
   /* USER CODE END 2 */
@@ -149,9 +189,26 @@ int main(void)
   setPixelColor(LED_SHIFT, current_color);
   updateLeds();
 
+  if( HAL_GPIO_ReadPin(SW1_GPIO_Port, SW1_Pin) ){
+	  current_src = SRC_POT;
+	  HAL_ADCEx_Calibration_Start(&hadc); // калибровка АЦП
+	  HAL_ADC_Start_DMA(&hadc, (uint32_t*)&pot_adc, 1); // запуск DMA
+	  HAL_TIM_OC_Start(&htim1, TIM_CHANNEL_4); // запуск таймера для опроса АЦП
+	  initPot(1);
+  } else {
+	  current_src = SRC_ENC;
+	  HAL_TIM_Encoder_Start_IT(&htim3, TIM_CHANNEL_ALL); // запуск энкодера
+	  initEnc(1);
+  }
+
   while (1)
   {
-	  handleEncoder();
+	  if( current_src == SRC_POT ){
+		  handlePot();
+	  } else
+	  if( current_src == SRC_ENC ){
+		  handleEnc();
+	  }
 	  handleI2C();
     /* USER CODE END WHILE */
 
@@ -237,8 +294,8 @@ static void MX_ADC_Init(void)
   hadc.Init.LowPowerAutoPowerOff = DISABLE;
   hadc.Init.ContinuousConvMode = DISABLE;
   hadc.Init.DiscontinuousConvMode = DISABLE;
-  hadc.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T1_CC4;
+  hadc.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
   hadc.Init.DMAContinuousRequests = DISABLE;
   hadc.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   if (HAL_ADC_Init(&hadc) != HAL_OK)
@@ -274,11 +331,18 @@ static void MX_I2C1_Init(void)
   /* USER CODE END I2C1_Init 0 */
 
   /* USER CODE BEGIN I2C1_Init 1 */
+  uint8_t address = 0x30;
+  if( HAL_GPIO_ReadPin(SW1_GPIO_Port, SW2_Pin) ){
+	  address |= 0b00000001;
+  }
+  if( HAL_GPIO_ReadPin(SW1_GPIO_Port, SW3_Pin) ){
+	  address |= 0b00000010;
+  }
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
   hi2c1.Init.Timing = 0x2000090E;
-  hi2c1.Init.OwnAddress1 = 66;
+  hi2c1.Init.OwnAddress1 = address<<1;//66;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
   hi2c1.Init.OwnAddress2 = 0;
@@ -310,6 +374,79 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 4800-1;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 200-1;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_OC_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_TOGGLE;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+
+}
+
+/**
   * @brief TIM3 Initialization Function
   * @param None
   * @retval None
@@ -330,7 +467,7 @@ static void MX_TIM3_Init(void)
   htim3.Instance = TIM3;
   htim3.Init.Prescaler = 0;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 63;
+  htim3.Init.Period = 65535;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
@@ -359,6 +496,22 @@ static void MX_TIM3_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -383,23 +536,23 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PA2 PA4 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_4;
+  /*Configure GPIO pins : SW2_Pin SW1_Pin */
+  GPIO_InitStruct.Pin = SW2_Pin|SW1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PA5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_5;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  /*Configure GPIO pin : BTN_Pin */
+  GPIO_InitStruct.Pin = BTN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(BTN_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PB1 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  /*Configure GPIO pin : SW3_Pin */
+  GPIO_InitStruct.Pin = SW3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(SW3_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI4_15_IRQn, 0, 0);
@@ -423,7 +576,7 @@ void transfer(uint8_t b){
 	}
 }
 
-// �?нициализация шины данных для светодиодов APA и отправка начального блока данных
+// инициализация шины данных для светодиодов APA и отправка начального блока данных
 //
 void startFrame()
 {
@@ -507,13 +660,126 @@ void testRGB(){
 		HAL_Delay(500);
 	}
 	clearLeds();
+
+	if( current_src == SRC_ENC ){
+		draw(0);
+	}
 }
 
-void handleEncoder(){
-	uint8_t enc_pos = (__HAL_TIM_GET_COUNTER(&htim3) >> 2 ) % 16;
+void initPot( uint8_t init ){
+	if( init ){
+		current_brightness = DEF_BRIGHTNESS;
+		current_color.red = DEF_COLOR_R;
+		current_color.green = DEF_COLOR_G;
+		current_color.blue = DEF_COLOR_B;
+		current_mode = MODE_LEVEL;
+	}
+}
+
+void handlePot(){
+	if( flag_adc ){
+		flag_adc = 0;
+		HAL_ADC_Stop_DMA(&hadc);
+		uint32_t fp_pot = (4095-pot_adc)<<10;
+		HAL_ADC_Start_DMA(&hadc, (uint32_t*)&pot_adc, 1);
+
+		pot_lpf = pot_lpf - ((pot_lpf*pot_lpf_k)>>10) + ((fp_pot*pot_lpf_k)>>10);
+		draw( pot_lpf>>18 ); //10+8
+	}
+}
+
+void initEnc( uint8_t init ){
+	if( init ){
+		enc_limit = 0;
+		enc_max = 0;
+		enc_stop = 0;
+		current_brightness = DEF_BRIGHTNESS;
+		current_color.red = DEF_COLOR_R;
+		current_color.green = DEF_COLOR_G;
+		current_color.blue = DEF_COLOR_B;
+		current_mode = MODE_LEVEL;
+	}
+	enc_pos = 0;
+	__HAL_TIM_SET_COUNTER(&htim3, 0);
+	draw(0);
+}
+
+void handleEnc(){
+
+	// вышло время лага кнопки
+	if( enc_btn_next && HAL_GetTick() > enc_btn_next ){
+		enc_btn_next = 0;
+	}
+
+	uint16_t enc_pos_new = __HAL_TIM_GET_COUNTER(&htim3);
+
+	// если значения не изменились
+	if( enc_pos_new == enc_pos ){
+		return;
+	}
+
+	// игнорировать значения некратные 4
+	if( enc_pos_new & 0b00000011 ){
+		return;
+	}
+
+	uint8_t reverse = __HAL_TIM_IS_TIM_COUNTING_DOWN(&htim3);
+	uint16_t enc_max_v = ((LED_Q)<<(2+enc_max))-4;
+
+	if( enc_limit && enc_stop == ENC_STOP_MIN ){
+		if( reverse ){
+			return;
+		} else {
+			enc_stop = 0;
+			enc_pos = 0;
+			__HAL_TIM_SET_COUNTER(&htim3, enc_pos);
+			draw( 0 );
+			return;
+		}
+	}
+
+	if( enc_limit && enc_stop == ENC_STOP_MAX ){
+		if( reverse ){
+			enc_stop = 0;
+			enc_pos = enc_max_v;
+			__HAL_TIM_SET_COUNTER(&htim3, enc_pos);
+			draw( enc_pos>>(2+enc_max) );
+			return;
+		} else {
+			return;
+		}
+	}
+
+	if( enc_pos_new > enc_max_v ){
+		if( enc_limit && !enc_stop ){
+			if( reverse ){
+				enc_pos = 0;
+				enc_stop = ENC_STOP_MIN;
+			} else {
+				enc_pos = enc_max_v;
+				enc_stop = ENC_STOP_MAX;
+			}
+		} else {
+			if( reverse ){
+				enc_pos = enc_max_v;
+				__HAL_TIM_SET_COUNTER(&htim3, enc_max_v);
+			} else {
+				enc_pos = 0;
+				__HAL_TIM_SET_COUNTER(&htim3, enc_pos);
+			}
+		}
+	} else {
+		enc_pos = enc_pos_new;
+	}
+
+	//draw( (((enc_pos<<10)/enc_max)*LED_MAX)>>10 );
+	draw( enc_pos>>(2+enc_max));
+}
+
+void draw( uint8_t pos ){
 	if( current_mode == MODE_FLOOD ){
 		for(uint8_t i = 0; i < LED_Q; i++) {
-			if( i <= enc_pos )
+			if( i <= pos )
 				setPixelColor(i, current_color);
 			else
 				setPixelColorRGB(i, 0,0,0);
@@ -522,8 +788,8 @@ void handleEncoder(){
 	}
 	else if( current_mode == MODE_LEVEL ){
 		for(uint8_t i = 0; i < LED_Q; i++) {
-			if( i <= enc_pos ){
-				setPixelColorRGB(i, enc_pos*17, 255-enc_pos*17, 0);
+			if( i <= pos ){
+				setPixelColorRGB(i, pos*17, 255-pos*17, 0);
 			} else {
 				setPixelColorRGB(i, 0,0,0);
 			}
@@ -532,7 +798,7 @@ void handleEncoder(){
 	}
 	else if( current_mode == MODE_POINT ){
 		for(uint8_t i = 0; i < LED_Q; i++) {
-			if( i == enc_pos ){
+			if( i == pos ){
 				setPixelColor(i, current_color);
 			} else {
 				setPixelColorRGB(i, 0,0,0);
@@ -542,54 +808,77 @@ void handleEncoder(){
 	}
 }
 
-void packInt(uint8_t target[], volatile uint16_t source[], uint8_t ssize, uint8_t tstart){
-	for(uint8_t i=0; i<ssize; i++){
-		target[tstart+i*2] = source[i] & 0xFF;
-		target[tstart+i*2+1] = source[i]>>8;
-	}
-}
-
 void handleI2C(){
 	if(i2c_data_ready){
 		i2c_data_ready = 0;
 
 		switch(i2c_recv_buf[0]) {
-    		case CMD_GET_EPOS:;
-    			uint8_t enc_pos = (__HAL_TIM_GET_COUNTER(&htim3) >> 2 ) % 16;
-    			i2c_send_buf[0] = enc_pos;
+			case CMD_GET_VERSION:
+				i2c_send_buf[0] = VERSION;
+				break;
+			case CMD_GET_SRC:
+    			i2c_send_buf[0] = current_src;
+				break;
+    		case CMD_GET_STATE:
+    			if( current_src == SRC_POT ){
+        			i2c_send_buf[0] = (pot_lpf>>10) & 0xFF;
+        			i2c_send_buf[1] = (pot_lpf>>18) & 0xFF;
+    			} else
+    			if( current_src == SRC_ENC ){
+    				uint16_t enc_pos4 = enc_pos>>2;
+        			i2c_send_buf[0] = enc_pos4 & 0xFF;
+        			i2c_send_buf[1] = (enc_pos4>>8) & 0xFF;
+        			i2c_send_buf[2] = !!enc_btn_next;
+    			}
     			break;
-    		case CMD_GET_PPOS:
-    			/*
-    			HAL_ADC_Stop_DMA(&hadc);
-
-    			packInt(i2c_send_buf, adc_buff, 2, 0);
-
-    			HAL_ADC_Start_DMA(&hadc, (uint32_t*)adc_buff, 2);
-    			*/
-    			break;
-    		case CMD_SET_MODE:
-    			current_mode = i2c_recv_buf[1];
+    		case CMD_SET_MODE:;
+    			uint8_t mode = i2c_recv_buf[1];
+    			if( mode == MODE_FLOOD || mode == MODE_LEVEL || mode == MODE_POINT ){
+    				current_mode = mode;
+    			}
     			break;
     		case CMD_SET_COLOR:
     			current_color.red = i2c_recv_buf[1];
     			current_color.green = i2c_recv_buf[2];
     			current_color.blue = i2c_recv_buf[3];
+    			draw( enc_pos>>(2+enc_max)); // перерисовка текущего значения
     			break;
     		case CMD_SET_BRIGHTNESS:
     			current_brightness = i2c_recv_buf[1];
+    			draw( enc_pos>>(2+enc_max)); // перерисовка текущего значения
     			break;
-    		case CMD_SET_SRC:
-    			current_src = i2c_recv_buf[1];
+    		case CMD_SET_POT_LPF:
+    			pot_lpf_k = i2c_recv_buf[1]<<6;
     			break;
-    		case CMD_RUN_TEST:
+    		case CMD_SET_ENC_LIMIT:
+    			enc_limit = i2c_recv_buf[1];
+				initEnc(0);
+    			break;
+    		case CMD_SET_ENC_MAX:
+    			enc_max = i2c_recv_buf[1];
+				initEnc(0);
+    			break;
+    		case CMD_TEST:
     			testRGB();
     			break;
+    		case CMD_INIT:
+    			if( current_src == SRC_POT ){
+    				initPot(1);
+    			} else
+    			if( current_src == SRC_ENC ){
+    				initEnc(1);
+				}
+    			break;
     		case CMD_RESET:
-    			__HAL_TIM_SET_COUNTER(&htim3, 0);
+    			if( current_src == SRC_POT ){
+    				initPot(0);
+    			} else
+    			if( current_src == SRC_ENC ){
+    				initEnc(0);
+				}
     			break;
     		default:
     			i2c_send_buf[0] = 0xFF;
-    			packet_size = 1;
 		}
 	}
 
@@ -618,6 +907,19 @@ void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c){
 }
 void HAL_I2C_ListenCpltCallback(I2C_HandleTypeDef *hi2c){
 	HAL_I2C_EnableListen_IT(hi2c);
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc){
+    if(hadc->Instance == ADC1){
+        flag_adc = 1;
+    }
+}
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
+	if(GPIO_Pin==BTN_Pin) {
+		enc_btn_next = HAL_GetTick() + ENC_BTN_TO;
+	} else{
+		__NOP();
+	}
 }
 /* USER CODE END 4 */
 
